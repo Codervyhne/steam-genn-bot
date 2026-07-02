@@ -44,6 +44,13 @@ async def home(request: web.Request) -> web.Response:
     return web.Response(text="Steam Genn bot is running. Use /health for cron checks.\n")
 
 
+def summarize_bot_error(exc: Exception) -> str:
+    raw = repr(exc)
+    if "1015" in raw or "Too Many Requests" in raw or "rate limited" in raw.lower():
+        return "Discord/Cloudflare is temporarily rate-limiting this Render IP. The bot will retry automatically."
+    return raw[:1000]
+
+
 async def run_discord_bot_forever(app: web.Application) -> None:
     delay = 60
     while True:
@@ -59,12 +66,19 @@ async def run_discord_bot_forever(app: web.Application) -> None:
             BOT_STATE["bot_status"] = "stopping"
             raise
         except Exception as exc:
+            raw_error = repr(exc)
+            is_rate_limited = (
+                "1015" in raw_error
+                or "Too Many Requests" in raw_error
+                or "rate limited" in raw_error.lower()
+            )
+            retry_delay = max(delay, 1800) if is_rate_limited else delay
             BOT_STATE["bot_status"] = "retry_wait"
-            BOT_STATE["bot_error"] = repr(exc)
-            BOT_STATE["next_retry_at"] = round(time.time() + delay)
-            print(f"Discord bot login/connect failed: {exc!r}. Retrying in {delay}s.", flush=True)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 1800)
+            BOT_STATE["bot_error"] = summarize_bot_error(exc)
+            BOT_STATE["next_retry_at"] = round(time.time() + retry_delay)
+            print(f"Discord bot login/connect failed: {BOT_STATE['bot_error']}. Retrying in {retry_delay}s.", flush=True)
+            await asyncio.sleep(retry_delay)
+            delay = min(retry_delay * 2, 3600)
 
 
 async def start_discord_bot(app: web.Application) -> None:
@@ -95,6 +109,7 @@ def create_app() -> web.Application:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     web.run_app(create_app(), host="0.0.0.0", port=port)
+
 
 
 
