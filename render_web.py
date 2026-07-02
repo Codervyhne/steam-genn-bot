@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 
 from aiohttp import web
@@ -7,11 +8,16 @@ from main import TOKEN, bot
 
 
 async def health(request: web.Request) -> web.Response:
+    latency = bot.latency
+    latency_ms = None
+    if isinstance(latency, (int, float)) and math.isfinite(latency):
+        latency_ms = round(latency * 1000)
+
     return web.json_response({
         "ok": not bot.is_closed(),
         "bot_user": str(bot.user) if bot.user else None,
         "guilds": len(bot.guilds),
-        "latency_ms": round(bot.latency * 1000) if bot.latency else None,
+        "latency_ms": latency_ms,
     })
 
 
@@ -44,3 +50,4 @@ def create_app() -> web.Application:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     web.run_app(create_app(), host="0.0.0.0", port=port)
+

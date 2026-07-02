@@ -560,7 +560,7 @@ class PremiumGeneratorView(discord.ui.View):
             count = get_premium_stock_count()
             embed.description = (
                 f"Click the button below to generate a premium account.\n\n"
-                f"**Cooldown:** 5 minutes\**Current Stock:** {count}"
+                f"**Cooldown:** 5 minutes\n**Current Stock:** {count}"
             )
             await message.edit(embed=embed, view=self)
 
@@ -847,6 +847,7 @@ class GeneratorBot(commands.Bot):
         self.add_view(GeneratorView())
         self.add_view(PremiumGeneratorView())
         self.add_view(StatsNotificationView())
+        self.tree.on_error = self.on_tree_error
         if not booster_premium_maintenance.is_running():
             booster_premium_maintenance.start()
 
@@ -901,16 +902,39 @@ class GeneratorBot(commands.Bot):
             except Exception as exc:
                 print(f"Failed to clear channel {channel_id}: {exc}")
 
-    async def on_ready(self):
-        load_state()
+    async def sync_slash_commands(self):
+        commands_to_sync = list(self.tree.get_commands())
+
+        self.tree.clear_commands(guild=None)
         await self.tree.sync()
+        print("Cleared global slash commands to prevent duplicates.")
+
         for guild in self.guilds:
             try:
-                self.tree.copy_global_to(guild=guild)
+                self.tree.clear_commands(guild=guild)
+                for command in commands_to_sync:
+                    self.tree.add_command(command, guild=guild)
                 await self.tree.sync(guild=guild)
                 print(f"Synced slash commands to {guild.name} ({guild.id})")
             except Exception as exc:
                 print(f"Failed to sync slash commands to {guild.id}: {exc}")
+
+    async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        print(f"Slash command error: {error!r}")
+        message = "That command hit an error. Try again in a moment."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    async def on_ready(self):
+        load_state()
+        await self.sync_slash_commands()
+        for guild in self.guilds:
+            await check_booster_premium_guild(guild)
         print(f"Logged in as {self.user.name} ({self.user.id})")
         print("Bot is ready!")
 
@@ -930,7 +954,7 @@ class GeneratorBot(commands.Bot):
                 title="Free Gen!",
                 description=(
                     f"Click the button below to generate a free account.\n\n"
-                    f"**Cooldown:** 10 minutes**Current Stock:** {count}"
+                    f"**Cooldown:** 10 minutes\n**Current Stock:** {count}"
                 ),
                 color=discord.Color.blue()
             )
@@ -949,7 +973,7 @@ class GeneratorBot(commands.Bot):
                 title="Premium Gen!",
                 description=(
                     f"Click the button below to generate a premium account.\n\n"
-                    f"**Cooldown:** 5 minutes\n **Current Stock:** {count}"
+                    f"**Cooldown:** 5 minutes\n**Current Stock:** {count}"
                 ),
                 color=discord.Color.gold()
             )
@@ -1141,6 +1165,84 @@ async def cmd_id(interaction: discord.Interaction):
     )
 
 
+
+
+def format_time(ts: float | int | None) -> str:
+    if not ts:
+        return "Unknown"
+    return f"<t:{int(float(ts))}:F> (<t:{int(float(ts))}:R>)"
+
+
+def build_boostpremium_embed(member: discord.Member) -> discord.Embed:
+    uid = str(member.id)
+    record = boost_subscriptions.get(uid)
+    role = member.guild.get_role(BOOSTER_PREMIUM_ROLE_ID)
+    has_premium_role = has_role(member, BOOSTER_PREMIUM_ROLE_ID)
+    boosting = is_current_booster(member)
+
+    embed = discord.Embed(
+        title="Temporary Premium",
+        color=discord.Color.gold() if has_premium_role else discord.Color.dark_gray(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="User", value=f"{member.mention}\n`{member.id}`", inline=False)
+    embed.add_field(name="Currently Boosting", value="Yes" if boosting else "No", inline=True)
+    embed.add_field(name="Premium Role", value="Assigned" if has_premium_role else "Not assigned", inline=True)
+    embed.add_field(name="Role", value=role.mention if role else f"Missing `{BOOSTER_PREMIUM_ROLE_ID}`", inline=True)
+
+    if record:
+        embed.add_field(name="Started", value=format_time(record.get("started_at")), inline=False)
+        embed.add_field(name="Expires", value=format_time(record.get("expires_at")), inline=False)
+        embed.add_field(name="Source", value=str(record.get("source", "server_boost")), inline=True)
+        embed.add_field(name="Kept While Boosting", value="Yes" if record.get("kept_while_boosting") else "No", inline=True)
+        if record.get("role_pending") or record.get("remove_pending"):
+            embed.add_field(name="Retry", value="Queued. The bot retries every 5 minutes.", inline=False)
+        if record.get("last_role_error"):
+            embed.add_field(name="Last Role Error", value=str(record.get("last_role_error"))[:1024], inline=False)
+    else:
+        embed.description = "No temporary premium record found for this user."
+
+    return embed
+
+
+@bot.tree.command(name="boostpremium", description="Check temporary premium from boosting")
+@app_commands.describe(user="Optional user to check. Admins can check other people.")
+async def cmd_boostpremium(interaction: discord.Interaction, user: discord.Member | None = None):
+    target = user or interaction.user
+    if user and isinstance(interaction.user, discord.Member) and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Only admins can check another user.", ephemeral=True)
+        return
+
+    if not isinstance(target, discord.Member):
+        await interaction.response.send_message("Run this inside the server.", ephemeral=True)
+        return
+
+    await ensure_booster_premium(target)
+    await interaction.response.send_message(embed=build_boostpremium_embed(target), ephemeral=True)
+
+
+@bot.tree.command(name="grantpremium", description="Grant temporary premium manually")
+@app_commands.describe(user="User to grant premium to", days="How many days", reason="Reason stored in the JSON file")
+@is_admin()
+async def cmd_grantpremium(interaction: discord.Interaction, user: discord.Member, days: int, reason: str = "Manual grant"):
+    if days <= 0 or days > 365:
+        await interaction.response.send_message("Days must be between 1 and 365.", ephemeral=True)
+        return
+
+    now = time.time()
+    boost_subscriptions[str(user.id)] = {
+        "user_id": user.id,
+        "started_at": now,
+        "expires_at": now + (days * 24 * 60 * 60),
+        "kept_while_boosting": False,
+        "source": "manual_grant",
+        "reason": reason,
+        "granted_by": interaction.user.id,
+    }
+    save_boost_subscriptions()
+    await ensure_booster_premium(user)
+    await interaction.response.send_message(embed=build_boostpremium_embed(user), ephemeral=True)
+
 @bot.tree.command(name="stats", description="View total generation statistics")
 @is_admin()
 async def cmd_stats(interaction: discord.Interaction):
@@ -1237,4 +1339,6 @@ async def bl_list(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
+
+
 
