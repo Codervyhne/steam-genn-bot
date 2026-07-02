@@ -25,7 +25,9 @@ async def health(request: web.Request) -> web.Response:
         "bot_ready": bot.is_ready(),
         "bot_closed": bot.is_closed(),
         "bot_task_done": task_done,
+        "bot_status": request.app.get("bot_status"),
         "bot_error": task_error,
+        "next_retry_at": request.app.get("next_retry_at"),
         "bot_user": str(bot.user) if bot.user else None,
         "guilds": len(bot.guilds),
         "latency_ms": latency_ms,
@@ -37,25 +39,37 @@ async def home(request: web.Request) -> web.Response:
     return web.Response(text="Steam Genn bot is running. Use /health for cron checks.\n")
 
 
+async def run_discord_bot_forever(app: web.Application) -> None:
+    delay = 60
+    while True:
+        try:
+            app["bot_status"] = "connecting"
+            app["bot_error"] = None
+            app["next_retry_at"] = None
+            print("Starting Discord bot client...", flush=True)
+            await bot.start(TOKEN, reconnect=True)
+            app["bot_status"] = "stopped"
+            app["bot_error"] = "Discord bot stopped without an exception."
+        except asyncio.CancelledError:
+            app["bot_status"] = "stopping"
+            raise
+        except Exception as exc:
+            app["bot_status"] = "retry_wait"
+            app["bot_error"] = repr(exc)
+            app["next_retry_at"] = round(time.time() + delay)
+            print(f"Discord bot login/connect failed: {exc!r}. Retrying in {delay}s.", flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 1800)
+
+
 async def start_discord_bot(app: web.Application) -> None:
     if not TOKEN:
         raise RuntimeError("Set DISCORD_TOKEN in Render environment variables.")
 
     app["bot_error"] = None
-    task = asyncio.create_task(bot.start(TOKEN))
-    app["bot_task"] = task
-
-    def report_bot_crash(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            app["bot_error"] = repr(exc)
-            print(f"Discord bot task stopped: {exc!r}", flush=True)
-
-    task.add_done_callback(report_bot_crash)
-
+    app["bot_status"] = "starting"
+    app["next_retry_at"] = None
+    app["bot_task"] = asyncio.create_task(run_discord_bot_forever(app))
 
 async def stop_discord_bot(app: web.Application) -> None:
     task = app.get("bot_task")
@@ -76,5 +90,7 @@ def create_app() -> web.Application:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     web.run_app(create_app(), host="0.0.0.0", port=port)
+
+
 
 
