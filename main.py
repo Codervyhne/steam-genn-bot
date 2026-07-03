@@ -29,6 +29,7 @@ RESTOCK_MAX_ACCOUNTS  = 500   # max accounts copied from pool per restock
 RESTOCK_MIN_DELAY     = 60    # seconds (1 min)
 RESTOCK_MAX_DELAY     = 300   # seconds (5 min)
 BOOSTER_PREMIUM_SECONDS = 3 * 24 * 60 * 60
+BASE_COOLDOWN_SECONDS = {"free": 600, "prem": 300}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("DATA_DIR", BASE_DIR)
@@ -69,6 +70,14 @@ notification_data = {
 }
 zero_stock_notified = {"free": False, "prem": False}
 boost_subscriptions: dict[str, dict] = {}
+cooldown_config = {
+    "defaults": {
+        "free": {"seconds": BASE_COOLDOWN_SECONDS["free"], "expires_at": None},
+        "prem": {"seconds": BASE_COOLDOWN_SECONDS["prem"], "expires_at": None},
+    },
+    "users": {"free": {}, "prem": {}},
+    "blocks": {"free": {}, "prem": {}},
+}
 
 # â”€â”€ Restock pending flags (prevent duplicate tasks) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 restock_pending = {"free": False, "prem": False}
@@ -76,9 +85,109 @@ restock_pending = {"free": False, "prem": False}
 
 # â”€â”€ Persistence helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+
+def merge_cooldown_config(loaded: dict) -> dict:
+    config = {
+        "defaults": {
+            "free": {"seconds": BASE_COOLDOWN_SECONDS["free"], "expires_at": None},
+            "prem": {"seconds": BASE_COOLDOWN_SECONDS["prem"], "expires_at": None},
+        },
+        "users": {"free": {}, "prem": {}},
+        "blocks": {"free": {}, "prem": {}},
+    }
+    for section in ("defaults", "users", "blocks"):
+        source = loaded.get(section, {})
+        if isinstance(source, dict):
+            for tier in ("free", "prem"):
+                value = source.get(tier)
+                if isinstance(value, dict):
+                    config[section][tier].update(value)
+    return config
+
+
+def cooldown_tier(value: str) -> str | None:
+    text = str(value or "").lower().strip()
+    if text == "free":
+        return "free"
+    if text in ("prem", "premium"):
+        return "prem"
+    return None
+
+
+def cooldown_tier_label(tier: str) -> str:
+    return "Free" if tier == "free" else "Premium"
+
+
+def duration_text(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def cleanup_cooldown_config() -> bool:
+    changed = False
+    now = time.time()
+    for tier in ("free", "prem"):
+        default = cooldown_config["defaults"].get(tier, {})
+        expires_at = default.get("expires_at")
+        if expires_at and now >= float(expires_at):
+            cooldown_config["defaults"][tier] = {
+                "seconds": BASE_COOLDOWN_SECONDS[tier],
+                "expires_at": None,
+            }
+            changed = True
+
+        for section in ("users", "blocks"):
+            records = cooldown_config[section].get(tier, {})
+            for uid, record in list(records.items()):
+                expires_at = record.get("expires_at") if isinstance(record, dict) else None
+                if expires_at and now >= float(expires_at):
+                    records.pop(uid, None)
+                    changed = True
+    return changed
+
+
+def get_generation_cooldown_seconds(tier: str, user_id: int) -> int:
+    if cleanup_cooldown_config():
+        save_cooldowns()
+    uid = str(user_id)
+    user_record = cooldown_config["users"].get(tier, {}).get(uid)
+    if isinstance(user_record, dict):
+        return max(0, int(user_record.get("seconds", BASE_COOLDOWN_SECONDS[tier])))
+    default_record = cooldown_config["defaults"].get(tier, {})
+    return max(0, int(default_record.get("seconds", BASE_COOLDOWN_SECONDS[tier])))
+
+
+def get_cooldown_block(tier: str, user_id: int) -> dict | None:
+    if cleanup_cooldown_config():
+        save_cooldowns()
+    return cooldown_config["blocks"].get(tier, {}).get(str(user_id))
+
+
+def cooldown_expiry(minutes: int | None) -> float | None:
+    if not minutes or minutes <= 0:
+        return None
+    return time.time() + (minutes * 60)
+
+
+def expiry_text(expires_at: float | int | None) -> str:
+    if not expires_at:
+        return "permanent"
+    return f"until <t:{int(float(expires_at))}:F> (<t:{int(float(expires_at))}:R>)"
 def load_state():
     """Load all persisted state from disk on startup."""
-    global free_cooldowns, prem_cooldowns, stats_data, blacklist_data, notification_data, boost_subscriptions
+    global free_cooldowns, prem_cooldowns, stats_data, blacklist_data, notification_data, boost_subscriptions, cooldown_config
 
     if os.path.exists(COOLDOWN_FILE):
         try:
@@ -133,7 +242,7 @@ def load_state():
 
 def save_cooldowns():
     with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"free": free_cooldowns, "prem": prem_cooldowns}, f)
+        json.dump({"free": free_cooldowns, "prem": prem_cooldowns, "config": cooldown_config}, f, indent=2)
 
 
 def save_stats():
@@ -450,7 +559,7 @@ class GeneratorView(discord.ui.View):
         user_id      = interaction.user.id
         uid_str      = str(user_id)
         current_time = time.time()
-        cooldown_duration = 600  # 10 minutes
+        cooldown_duration = get_generation_cooldown_seconds("free", user_id)
 
         # â”€â”€ Blacklist check â”€â”€
         if user_id in blacklist_data.get("free", []):
@@ -573,7 +682,7 @@ class PremiumGeneratorView(discord.ui.View):
         user_id      = interaction.user.id
         uid_str      = str(user_id)
         current_time = time.time()
-        cooldown_duration = 300  # 5 minutes
+        cooldown_duration = get_generation_cooldown_seconds("prem", user_id)
 
         # â”€â”€ Blacklist check â”€â”€
         if user_id in blacklist_data.get("prem", []):
@@ -1129,23 +1238,161 @@ async def cmd_clearstock(interaction: discord.Interaction, tier: str):
 @app_commands.describe(tier="free or premium", user="The user whose cooldown to clear")
 @is_admin()
 async def cmd_clearcooldown(interaction: discord.Interaction, tier: str, user: discord.Member):
-    tier = tier.lower()
-    if tier not in ("free", "premium"):
+    tier_key = cooldown_tier(tier)
+    if not tier_key:
         await interaction.response.send_message("Tier must be `free` or `premium`.", ephemeral=True)
         return
 
     uid_str = str(user.id)
-    if tier == "free":
+    if tier_key == "free":
         free_cooldowns.pop(uid_str, None)
     else:
         prem_cooldowns.pop(uid_str, None)
+    cooldown_config["users"][tier_key].pop(uid_str, None)
+    cooldown_config["blocks"][tier_key].pop(uid_str, None)
     save_cooldowns()
 
     await interaction.response.send_message(
-        f"âœ… Cleared **{tier}** cooldown for {user.mention}.", ephemeral=True
+        f"Cleared **{cooldown_tier_label(tier_key)}** cooldowns and overrides for {user.mention}.",
+        ephemeral=True
     )
 
 
+
+@bot.tree.command(name="setcooldown", description="Set generator or user cooldown length")
+@app_commands.describe(
+    tier="free or premium",
+    seconds="Cooldown length after each generation, in seconds",
+    user="Optional user override. Leave empty to change the whole generator.",
+    expires_in_minutes="Optional. 0 or blank means permanent until changed."
+)
+@is_admin()
+async def cmd_setcooldown(
+    interaction: discord.Interaction,
+    tier: str,
+    seconds: int,
+    user: discord.Member | None = None,
+    expires_in_minutes: int = 0,
+):
+    tier_key = cooldown_tier(tier)
+    if not tier_key:
+        await interaction.response.send_message("Tier must be `free` or `premium`.", ephemeral=True)
+        return
+    if seconds < 0 or seconds > 604800:
+        await interaction.response.send_message("Seconds must be between `0` and `604800`.", ephemeral=True)
+        return
+
+    expires_at = cooldown_expiry(expires_in_minutes)
+    record = {"seconds": seconds, "expires_at": expires_at, "updated_by": interaction.user.id}
+    if user:
+        cooldown_config["users"][tier_key][str(user.id)] = record
+        target = user.mention
+    else:
+        cooldown_config["defaults"][tier_key] = record
+        target = f"the **{cooldown_tier_label(tier_key)}** generator"
+    save_cooldowns()
+
+    await interaction.response.send_message(
+        f"Set cooldown for {target} to **{duration_text(seconds)}** ({expiry_text(expires_at)}).",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="cooldownblock", description="Put a user on a generator cooldown now")
+@app_commands.describe(
+    tier="free or premium",
+    user="User to cooldown",
+    minutes="How long to block them. 0 means permanent until cleared.",
+    reason="Optional reason"
+)
+@is_admin()
+async def cmd_cooldownblock(
+    interaction: discord.Interaction,
+    tier: str,
+    user: discord.Member,
+    minutes: int = 0,
+    reason: str = "Manual cooldown block",
+):
+    tier_key = cooldown_tier(tier)
+    if not tier_key:
+        await interaction.response.send_message("Tier must be `free` or `premium`.", ephemeral=True)
+        return
+    if minutes < 0 or minutes > 525600:
+        await interaction.response.send_message("Minutes must be between `0` and `525600`.", ephemeral=True)
+        return
+
+    expires_at = cooldown_expiry(minutes)
+    cooldown_config["blocks"][tier_key][str(user.id)] = {
+        "expires_at": expires_at,
+        "reason": reason,
+        "updated_by": interaction.user.id,
+    }
+    if expires_at:
+        if tier_key == "free":
+            free_cooldowns[str(user.id)] = expires_at
+        else:
+            prem_cooldowns[str(user.id)] = expires_at
+    save_cooldowns()
+
+    await interaction.response.send_message(
+        f"Put {user.mention} on **{cooldown_tier_label(tier_key)}** cooldown {expiry_text(expires_at)}.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="cooldownstatus", description="Show cooldown settings for a generator or user")
+@app_commands.describe(tier="free or premium", user="Optional user to inspect")
+@is_admin()
+async def cmd_cooldownstatus(interaction: discord.Interaction, tier: str, user: discord.Member | None = None):
+    tier_key = cooldown_tier(tier)
+    if not tier_key:
+        await interaction.response.send_message("Tier must be `free` or `premium`.", ephemeral=True)
+        return
+    if cleanup_cooldown_config():
+        save_cooldowns()
+
+    default_record = cooldown_config["defaults"].get(tier_key, {})
+    embed = discord.Embed(
+        title=f"{cooldown_tier_label(tier_key)} Cooldowns",
+        color=discord.Color.blurple(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(
+        name="Generator Default",
+        value=(
+            f"**{duration_text(int(default_record.get('seconds', BASE_COOLDOWN_SECONDS[tier_key])))}**\n"
+            f"Scope: {expiry_text(default_record.get('expires_at'))}"
+        ),
+        inline=False
+    )
+
+    if user:
+        uid = str(user.id)
+        user_record = cooldown_config["users"].get(tier_key, {}).get(uid)
+        block_record = cooldown_config["blocks"].get(tier_key, {}).get(uid)
+        active_map = free_cooldowns if tier_key == "free" else prem_cooldowns
+        active_expires = active_map.get(uid)
+        embed.add_field(name="User", value=f"{user.mention}\n`{user.id}`", inline=False)
+        embed.add_field(
+            name="User Override",
+            value=(
+                f"**{duration_text(int(user_record.get('seconds')))}**\n{expiry_text(user_record.get('expires_at'))}"
+                if user_record else "None"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="Cooldown Block",
+            value=expiry_text(block_record.get("expires_at")) if block_record else "None",
+            inline=True
+        )
+        embed.add_field(
+            name="Current Active Cooldown",
+            value=expiry_text(active_expires) if active_expires and float(active_expires) > time.time() else "None",
+            inline=True
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 @bot.tree.command(name="stockcount", description="Check current stock levels for both tiers")
 @is_admin()
 async def cmd_stockcount(interaction: discord.Interaction):
@@ -1339,6 +1586,9 @@ async def bl_list(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
+
+
+
 
 
 
