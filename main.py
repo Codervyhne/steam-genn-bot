@@ -22,6 +22,11 @@ ALERT_ROLE_ID            = 1521710733992267789   # pinged on low stock / logs
 GUARD_CHANNEL_ID         = 1521710735091044512   # no-talk channel â€“ speakers get kicked
 INVITE_LINK              = "https://discord.gg/pdfFPjG5gr"
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN")
+if not TOKEN:
+    try:
+        from token_config import DISCORD_TOKEN as TOKEN
+    except ImportError:
+        TOKEN = None
 
 STOCK_ALERT_THRESHOLD = 5
 RESTOCK_MIN_ACCOUNTS  = 100   # min accounts copied from pool per restock
@@ -1740,6 +1745,7 @@ async def bl_list(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
+
 
 
 
