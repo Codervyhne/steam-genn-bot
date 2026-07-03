@@ -50,6 +50,7 @@ MONITOR_FILE       = data_file("monitor.json")
 BLACKLIST_FILE     = data_file("blacklist.json")
 NOTIFY_FILE        = data_file("notifications.json")
 BOOST_SUBS_FILE    = data_file("boost_subscriptions.json")
+GEN_HISTORY_FILE   = data_file("gen_history.json")
 FREE_STOCK_FILE    = data_file("freestock.txt")
 PREMIUM_STOCK_FILE = data_file("premstock.txt")
 STOCK_POOL_FILE    = data_file("stockpool.txt")   # large pool used for auto-restock (never modified)
@@ -64,6 +65,9 @@ prem_cooldowns: dict[str, float] = {}
 stats_data: dict[str, int]       = {"free_generated": 0, "prem_generated": 0}
 stock_monitor_msg_id: int | None = None
 blacklist_data: dict[str, list]  = {"free": [], "prem": []}  # lists of int user IDs
+blacklist_reasons: dict[str, dict] = {"free": {}, "prem": {}}
+gen_history: list[dict] = []
+GEN_HISTORY_LIMIT = 500
 notification_data = {
     "webhook_url": "",
     "events": {"stock_zero": False, "auto_restock": False}
@@ -185,9 +189,41 @@ def expiry_text(expires_at: float | int | None) -> str:
     if not expires_at:
         return "permanent"
     return f"until <t:{int(float(expires_at))}:F> (<t:{int(float(expires_at))}:R>)"
+
+
+def blacklist_reason(tier: str, user_id: int) -> str | None:
+    record = blacklist_reasons.get(tier, {}).get(str(user_id))
+    if isinstance(record, dict):
+        return record.get("reason")
+    if isinstance(record, str):
+        return record
+    return None
+
+
+def blacklist_message(tier: str, user_id: int) -> str:
+    reason = blacklist_reason(tier, user_id)
+    label = "free" if tier == "free" else "premium"
+    if reason:
+        return f"You are blacklisted from the {label} generator. Reason: {reason}"
+    return f"You are blacklisted from the {label} generator."
+
+
+def add_generation_history(tier: str, user: discord.User, username: str, password: str):
+    gen_history.append({
+        "tier": tier,
+        "user_id": user.id,
+        "username": user.name,
+        "display_name": getattr(user, "display_name", user.name),
+        "account_username": username,
+        "account_password": password,
+        "generated_at": time.time(),
+    })
+    if len(gen_history) > GEN_HISTORY_LIMIT:
+        del gen_history[:-GEN_HISTORY_LIMIT]
+    save_gen_history()
 def load_state():
     """Load all persisted state from disk on startup."""
-    global free_cooldowns, prem_cooldowns, stats_data, blacklist_data, notification_data, boost_subscriptions, cooldown_config
+    global free_cooldowns, prem_cooldowns, stats_data, blacklist_data, blacklist_reasons, gen_history, notification_data, boost_subscriptions, cooldown_config
 
     if os.path.exists(COOLDOWN_FILE):
         try:
@@ -195,6 +231,9 @@ def load_state():
                 data = json.load(f)
             free_cooldowns = data.get("free", {})
             prem_cooldowns = data.get("prem", {})
+            loaded_config = data.get("config")
+            if isinstance(loaded_config, dict):
+                cooldown_config = merge_cooldown_config(loaded_config)
         except Exception:
             pass
 
@@ -208,7 +247,14 @@ def load_state():
     if os.path.exists(BLACKLIST_FILE):
         try:
             with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
-                blacklist_data = json.load(f)
+                loaded_blacklist = json.load(f)
+                if isinstance(loaded_blacklist, dict):
+                    blacklist_data["free"] = loaded_blacklist.get("free", [])
+                    blacklist_data["prem"] = loaded_blacklist.get("prem", [])
+                    loaded_reasons = loaded_blacklist.get("reasons", {})
+                    if isinstance(loaded_reasons, dict):
+                        blacklist_reasons["free"] = loaded_reasons.get("free", {})
+                        blacklist_reasons["prem"] = loaded_reasons.get("prem", {})
         except Exception:
             pass
 
@@ -239,6 +285,15 @@ def load_state():
         except Exception:
             pass
 
+    if os.path.exists(GEN_HISTORY_FILE):
+        try:
+            with open(GEN_HISTORY_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                gen_history = loaded[-GEN_HISTORY_LIMIT:]
+        except Exception:
+            pass
+
 
 def save_cooldowns():
     with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
@@ -252,7 +307,7 @@ def save_stats():
 
 def save_blacklist():
     with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(blacklist_data, f)
+        json.dump({"free": blacklist_data.get("free", []), "prem": blacklist_data.get("prem", []), "reasons": blacklist_reasons}, f, indent=2)
 
 
 def save_notifications():
@@ -263,6 +318,11 @@ def save_notifications():
 def save_boost_subscriptions():
     with open(BOOST_SUBS_FILE, "w", encoding="utf-8") as f:
         json.dump(boost_subscriptions, f, indent=2)
+
+
+def save_gen_history():
+    with open(GEN_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(gen_history[-GEN_HISTORY_LIMIT:], f, indent=2)
 
 
 def save_monitor_id(msg_id: int):
@@ -564,7 +624,7 @@ class GeneratorView(discord.ui.View):
         # â”€â”€ Blacklist check â”€â”€
         if user_id in blacklist_data.get("free", []):
             await interaction.response.send_message(
-                "You are blacklisted from the free generator.", ephemeral=True
+                blacklist_message("free", user_id), ephemeral=True
             )
             return
 
@@ -630,6 +690,7 @@ class GeneratorView(discord.ui.View):
             save_cooldowns()
             stats_data["free_generated"] += 1
             save_stats()
+            add_generation_history("free", interaction.user, username, password)
 
             await interaction.followup.send("Your account has been sent to your DMs!", ephemeral=True)
             await self.update_panel_stock(interaction.message)
@@ -687,7 +748,7 @@ class PremiumGeneratorView(discord.ui.View):
         # â”€â”€ Blacklist check â”€â”€
         if user_id in blacklist_data.get("prem", []):
             await interaction.response.send_message(
-                "You are blacklisted from the premium generator.", ephemeral=True
+                blacklist_message("prem", user_id), ephemeral=True
             )
             return
 
@@ -762,6 +823,7 @@ class PremiumGeneratorView(discord.ui.View):
             save_cooldowns()
             stats_data["prem_generated"] += 1
             save_stats()
+            add_generation_history("premium", interaction.user, username, password)
 
             await interaction.followup.send("Your premium account has been sent to your DMs!", ephemeral=True)
             await self.update_panel_stock(interaction.message)
@@ -1490,6 +1552,79 @@ async def cmd_grantpremium(interaction: discord.Interaction, user: discord.Membe
     await ensure_booster_premium(user)
     await interaction.response.send_message(embed=build_boostpremium_embed(user), ephemeral=True)
 
+
+@bot.tree.command(name="premiumexpires", description="Check when temporary premium expires")
+@app_commands.describe(user="Optional user to check. Admins can check other people.")
+async def cmd_premiumexpires(interaction: discord.Interaction, user: discord.Member | None = None):
+    target = user or interaction.user
+    if user and isinstance(interaction.user, discord.Member) and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Only admins can check another user.", ephemeral=True)
+        return
+    if not isinstance(target, discord.Member):
+        await interaction.response.send_message("Run this inside the server.", ephemeral=True)
+        return
+
+    await ensure_booster_premium(target)
+    record = boost_subscriptions.get(str(target.id))
+    embed = discord.Embed(title="Premium Expiration", color=discord.Color.gold(), timestamp=datetime.utcnow())
+    embed.add_field(name="User", value=f"{target.mention}\n`{target.id}`", inline=False)
+
+    if record:
+        embed.add_field(name="Started", value=format_time(record.get("started_at")), inline=False)
+        embed.add_field(name="Expires", value=format_time(record.get("expires_at")), inline=False)
+        embed.add_field(name="Source", value=str(record.get("source", "server_boost")), inline=True)
+        embed.add_field(name="Currently Boosting", value="Yes" if is_current_booster(target) else "No", inline=True)
+        if record.get("kept_while_boosting") and is_current_booster(target):
+            embed.add_field(name="Status", value="Past the 3 day grant, but kept while still boosting.", inline=False)
+    elif has_role(target, PREMIUM_ROLE_ID):
+        embed.add_field(name="Status", value="Permanent premium role. No expiration stored.", inline=False)
+    else:
+        embed.add_field(name="Status", value="No temporary premium record found.", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="genhistory", description="Show recent generation history")
+@app_commands.describe(user="Optional user to filter", tier="Optional tier: free or premium", limit="How many entries, max 10")
+@is_admin()
+async def cmd_genhistory(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    tier: str = "all",
+    limit: int = 5,
+):
+    limit = max(1, min(limit, 10))
+    tier_key = cooldown_tier(tier) if tier.lower() != "all" else None
+    if tier.lower() != "all" and not tier_key:
+        await interaction.response.send_message("Tier must be `free`, `premium`, or `all`.", ephemeral=True)
+        return
+
+    rows = []
+    for record in reversed(gen_history):
+        if user and int(record.get("user_id", 0)) != user.id:
+            continue
+        if tier_key:
+            record_tier = "prem" if record.get("tier") in ("prem", "premium") else "free"
+            if record_tier != tier_key:
+                continue
+        rows.append(record)
+        if len(rows) >= limit:
+            break
+
+    embed = discord.Embed(title="Generation History", color=discord.Color.blurple(), timestamp=datetime.utcnow())
+    if not rows:
+        embed.description = "No matching generation history found."
+    else:
+        for record in rows:
+            generated_at = int(float(record.get("generated_at", time.time())))
+            tier_name = "Premium" if record.get("tier") in ("prem", "premium") else "Free"
+            value = (
+                f"User: <@{record.get('user_id')}> (`{record.get('user_id')}`)\n"
+                f"Account: `{record.get('account_username')}:{record.get('account_password')}`\n"
+                f"Time: <t:{generated_at}:F> (<t:{generated_at}:R>)"
+            )
+            embed.add_field(name=tier_name, value=value[:1024], inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 @bot.tree.command(name="stats", description="View total generation statistics")
 @is_admin()
 async def cmd_stats(interaction: discord.Interaction):
@@ -1517,9 +1652,9 @@ bot.tree.add_command(blacklist_group)
 
 
 @blacklist_group.command(name="add", description="Blacklist a user from free, premium, or both generators")
-@app_commands.describe(user="The user to blacklist", tier="free, premium, or both")
+@app_commands.describe(user="The user to blacklist", tier="free, premium, or both", reason="Reason shown to admins and the blacklisted user")
 @is_admin()
-async def bl_add(interaction: discord.Interaction, user: discord.Member, tier: str):
+async def bl_add(interaction: discord.Interaction, user: discord.Member, tier: str, reason: str = "No reason provided"):
     tier = tier.lower()
     if tier not in ("free", "premium", "both"):
         await interaction.response.send_message("Tier must be `free`, `premium`, or `both`.", ephemeral=True)
@@ -1527,19 +1662,34 @@ async def bl_add(interaction: discord.Interaction, user: discord.Member, tier: s
 
     tiers = ["free", "prem"] if tier == "both" else [tier if tier == "free" else "prem"]
     added_to = []
+    updated_to = []
+    now = time.time()
     for t in tiers:
         if user.id not in blacklist_data[t]:
             blacklist_data[t].append(user.id)
             added_to.append("free" if t == "free" else "premium")
+        else:
+            updated_to.append("free" if t == "free" else "premium")
+        blacklist_reasons[t][str(user.id)] = {
+            "reason": reason,
+            "updated_by": interaction.user.id,
+            "updated_at": now,
+        }
     save_blacklist()
 
-    if added_to:
+    changed = added_to or updated_to
+    if changed:
+        parts = []
+        if added_to:
+            parts.append(f"blacklisted from **{', '.join(added_to)}**")
+        if updated_to and not added_to:
+            parts.append(f"updated for **{', '.join(updated_to)}**")
         await interaction.response.send_message(
-            f"ðŸš« {user.mention} has been blacklisted from: **{', '.join(added_to)}**.", ephemeral=True
+            f"{user.mention} {', '.join(parts)}. Reason: `{reason}`", ephemeral=True
         )
     else:
         await interaction.response.send_message(
-            f"{user.mention} was already blacklisted from those tier(s).", ephemeral=True
+            f"{user.mention} was already blacklisted from those tier(s). Reason updated.", ephemeral=True
         )
 
 
@@ -1576,16 +1726,25 @@ async def bl_remove(interaction: discord.Interaction, user: discord.Member, tier
 async def bl_list(interaction: discord.Interaction):
     embed = discord.Embed(title="ðŸš« Blacklisted Users", color=discord.Color.red())
 
-    def fmt(ids):
-        return "\n".join(f"<@{uid}> (`{uid}`)" for uid in ids) or "*None*"
+    def fmt(tier_name, ids):
+        rows = []
+        for uid in ids:
+            reason = blacklist_reason(tier_name, int(uid)) or "No reason provided"
+            rows.append(f"<@{uid}> (`{uid}`) - {reason}")
+        return "\n".join(rows) or "*None*"
 
-    embed.add_field(name="Free",    value=fmt(blacklist_data.get("free", [])), inline=False)
-    embed.add_field(name="Premium", value=fmt(blacklist_data.get("prem", [])), inline=False)
+    embed.add_field(name="Free",    value=fmt("free", blacklist_data.get("free", []))[:1024], inline=False)
+    embed.add_field(name="Premium", value=fmt("prem", blacklist_data.get("prem", []))[:1024], inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 if __name__ == "__main__":
     bot.run(TOKEN)
+
+
+
+
+
 
 
 
